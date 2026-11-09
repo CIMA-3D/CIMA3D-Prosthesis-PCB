@@ -8,3 +8,13 @@ El otro proyecto que tenemos es la misma protesis pero no utiliza una PCB sino u
 
 **Codigo para primera protesis en placa de topos**
 **[CIMA3D-Prosthesis](https://github.com/CIMA-3D/CIMA3D-Prosthesis.git)**
+
+## Documentacion 
+La mayor parte de documentacion del este proyecto esta en otro repositorio **[Documentacion general](https://github.com/CIMA-3D/Documentacion_general.git)**
+
+Se realizo de este modo para poder mantener un buen flujo de verciones del codigo
+
+## Flujo de trabajo
+- codigo listo para compilar *-main
+- Desarrollo, Integración y test en *-develop
+- Versionado explícito *-feature
