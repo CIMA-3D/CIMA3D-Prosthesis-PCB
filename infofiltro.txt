@@ -1,0 +1,268 @@
+INFORME DE FILTRADO DE LA SENAL EMG
+===================================
+
+Alcance
+-------
+Este documento describe el recorrido de las dos senales EMG desde el ADC hasta la
+clasificacion y el control. Las rutas analizadas son los archivos principales del
+firmware, especialmente main/emg_continuous_sampling.cpp,
+main/main.cpp, components/EMGController/EMGController.cpp
+y main/NeuralNetwork.cpp.
+
+NOTA: Los comentarios C++ "//" y los bloques no activos no forman parte de la
+ejecucion. "Activo" significa que existe una llamada real desde el firmware actual;
+"inactivo" significa que existe codigo pero una bandera o condicion impide su uso.
+
+
+1. LISTA DE TODAS LAS FUNCIONES DE FILTRADO/PROCESAMIENTO DE SENAL
+-----------------------------------------------------------------
+
+EMGController::applyPowerLineFilter()
+Archivo: components/EMGController/EMGController.cpp
+Funcion: filtro comb representado como:
+  y[n] = x[n] - x[n-N] + 0.5*y[n-N], con N = 20.
+Su proposito declarado es eliminar componente de red electrica a 50 Hz.
+Estado: ACTIVA.
+
+EMGController::applyLPFilter()
+Archivo: components/EMGController/EMGController.cpp
+Funcion: filtro Butterworth pasobajo de segundo orden de aproximadamente 2 Hz.
+Toma el valor absoluto de la senal ya procesada y actualiza dos estados.
+Estado: ACTIVA.
+
+EMGController::normalize()
+Archivo: components/EMGController/EMGController.cpp
+Funcion: adapta automaticamente los niveles minimo y maximo de la envolvente.
+Lleva la senal a una escala cercana a 0-100 y permite elevarla al cuadrado.
+Estado: ACTIVA. squareEnvelope esta desactivado por squareEmgEnvelope = false.
+
+EMGController::update()
+Archivo: components/EMGController/EMGController.cpp
+Funcion: detecta cruce de umbral, histesis, duracion excesiva y finalizacion
+de pulso. No es un filtro analogico, pero actua como procesamiento temporal.
+Estado: ACTIVO.
+
+EMGController::applyULPFilter()
+Archivo: components/EMGController/EMGController.cpp
+Funcion: aplica dos filtros pasobajos adicionales en cascada a la senal absoluta.
+Estado: INACTIVA. Solo la llama EMGController::updateSmooth().
+
+EMGController::updateSmooth()
+Archivo: components/EMGController/EMGController.cpp
+Funcion: llama a applyULPFilter(), aplica un factor de escala dinamico y limita
+el resultado a 100.
+Estado: INACTIVA en el firmware actual:
+enableCustomPrintingTask = false y esta llamada solo se ejecuta si esa bandera es true.
+
+EMGController::setSquareEnvelope(bool square)
+Archivo: components/EMGController/include/EMGController.h
+Funcion: activa o desactiva elevar al cuadrado la envolvente normalizada.
+Estado: LLAMADA PERO DESACTIVADA:
+squareEmgEnvelope = false, por lo que normalize() no eleva al cuadrado.
+
+NnInput::update()
+Archivo: main/NeuralNetwork.cpp
+Funcion: acumula una ventana de 128 muestras/ventana y calcula cinco caracteristicas:
+  F0/F1: envolvente instantanea de cada canal.
+  F2: media de las envolventes del canal 0.
+  F3: media de las envolventes del canal 1.
+  F4: diferencia absoluta instantanea entre ambos canales.
+La diferencia absoluta se calculaba como absSlopeMean, pero el codigo la reordenada
+como media de canal y al final guarda abs(mean[0]-mean[1]) en globalMean.
+Estado: ACTIVO si enableNeuralNetwork = true.
+
+NN::run()
+Archivo: main/NeuralNetwork.cpp
+Funcion: aplica StandardScaler a las cinco caracteristicas con nn_scaler_mean y
+nn_scaler_std, escribe el vector en el tensor TFLite, ejecuta inferencia y obtiene
+el indice de mayor probabilidad.
+Estado: ACTIVO si enableNeuralNetwork = true y NN esta lleno.
+
+NnOutputPostProcess::process()
+Archivo: main/NeuralNetwork.cpp
+Funcion: filtro EMA/debouncer de las probabilidades de la red:
+  pSmooth[c] = alpha*prob[c] + (1-alpha)*pSmooth[c]
+Despues exige 2 muestras sobre thetaOn para cambiar de clase, 2 muestras debajo
+de thetaOff para volver a reposo y evita cambios con un solo pico.
+Estado: ACTIVO. main.cpp lo inicializa con alpha=0.3, thetaOn=0.9,
+thetaOff=0.3, nOn=2 y mOff=2.
+
+Normalizacion del ADC / remapeo
+Archivo: main/emg_continuous_sampling.cpp
+Funciones: initAdc(), readAdc(), callbacks onConversionCallback y onPoolOverflow.
+No son filtros digitales: muestrean 20 kHz, extraen 12 bits por canal y
+remapean el canal hardware al indice de buffer.
+Estado: ACTIVO.
+
+
+2. RECORRIDO COMPLETO DE LA SENAL EMG
+------------------------------------
+
+Etapa A - Conversion del sensor
+1. initAdc() configura dos canales EMG sobre ADC_UNIT_1.
+2. Para cada canal se convierte el pin a canal hardware con:
+   (emgPins[i] - 1) % 10.
+3. El ADC muestrea a 20 kHz y con ADC_ATTEN_DB_12.
+4. onConversionCallback() avisa por notificacion a samplingTask.
+
+Etapa B - Lectura y organizacion
+1. samplingTask() recibe la notificacion y llama a readAdc().
+2. readAdc() lee FRAME_SIZE bytes.
+3. Se interpreta adc_digi_output_data_t::type2.
+4. channelMap[] convierte el canal hardware al indice 0/1.
+5. El dato 12 bits se guarda en rawEmgSampleBuffer[channel].
+
+Etapa C - Pipeline digital principal
+Cada evento realiza, para cada canal i:
+1. applyPowerLineFilter() sobre rawEmgSampleBuffer[i].
+   Resultado en _sample.
+2. applyLPFilter() sobre abs(_sample).
+   Resultado inicial en _envelope.
+3. normalize() adapta el rango y actualiza _envelope.
+   Si squareEmgEnvelope esta activo, aplica potencia cuadrada; actualmente no.
+4. update() aplica umbral e histesis y puede activar/inactivar el canal.
+5. Si enableNeuralNetwork es true, nnInput.update(emgs) incorpora la envolvente
+   procesada a la historia de caracteristicas.
+
+Etapa D - Generacion de caracteristicas
+1. NnInput acumula dos canales durante una ventana de 128 muestras.
+2. Cada nn_step_size = 64 incrementos, llena una fila temporal con:
+   envolventes instantaneas, medias por canal y diferencia absoluta.
+3. nnHistoryBufferSize contiene el numero suficiente de ventanas mas dos.
+4. getFeatures() entrega el historial solicitado a NN::run().
+
+Etapa E - Clasificacion
+1. NN::run() estandariza las cinco caracteristicas.
+2. Ejecuta el modelo TensorFlow Lite.
+3. Obtiene cuatro probabilidades de salida.
+4. nnOutPp.process(probs) suaviza las probabilidades y evita parpadeos.
+5. El indice de clase confirmado se usa para controlar mano/muneon.
+
+
+3. FUNCIONES QUE SE EJECUTAN REALMENTE
+--------------------------------------
+
+Cadena activa desde el arranque:
+
+initAdc()
+  -> ADC hardware 20 kHz
+  -> onConversionCallback()
+  -> samplingTask()
+  -> readAdc()
+  -> applyPowerLineFilter()
+  -> applyLPFilter()
+  -> normalize()
+  -> update()
+  -> nnInput.update() cuando enableNeuralNetwork = true
+  -> NN::run()
+  -> NnOutputPostProcess::process()
+
+Condiciones actuales:
+- numEmgChannels = 2.
+- samplePrimaryEmgSensors = true.
+- enableNeuralNetwork = true.
+- squareEmgEnvelope = false.
+- enableCustomPrintingTask = false.
+- printRawEmg = false.
+- printFilteredEmg = false.
+- printEmgEnvelope = true.
+
+
+4. FILTROS ACTIVOS, INACTIVOS Y COMENTADOS
+------------------------------------------
+
+ACTIVOS
+- applyPowerLineFilter(): llamada para ambos canales en cada muestra.
+- applyLPFilter(): llamada para ambos canales en cada muestra.
+- normalize(): llamada en el pipeline principal.
+- update(): no es filtro, pero aplica umbral/histesis y es activo.
+- NN::run(): escalado y inferencia activos con enableNeuralNetwork true.
+- NnInput::update(): genera las caracteristicas activamente.
+- NnOutputPostProcess::process(): EMA/debouncer activado en mainTask.
+- Separacion por arranque: emgCalibrated impide el procesamiento hasta completar
+  calibrationTime. Actualmente calibrationTime = 0, por lo que no hay espera.
+
+INACTIVOS POR BANDERA
+- applyULPFilter(): no se ejecuta desde samplingTask.
+- updateSmooth(): no se ejecuta porque enableCustomPrintingTask = false.
+- squareEnvelope: se configura false por squareEmgEnvelope = false.
+- smoothControl(): existe en el codigo, pero no tiene llamada activa desde el
+  recorrido principal actual.
+- triggerControl: false por defecto, por lo que emgControl() no se ejecuta desde
+  mainTask. No es parte del filtrado, pero evita ejecucion de umbrales legacy.
+- printFilteredEmg y printRawEmg: desactivan exclusivamente la salida grafica,
+  no desactivan los filtros internos.
+
+INACTIVOS POR RUTAS NO UTILIZADAS
+- AdcSingleRead.cpp contiene otra forma de lectura ADC, pero no se usa en
+  samplingTask actual; el sistema activo usa adc_continuous de
+  emg_continuous_sampling.cpp.
+- checkTouchFeedback(), readSecondarySensors() y rutas I2C asociadas estan
+  deshabilitados o pendientes.
+
+CODIGO COMENTADO RELACIONADO CON FILTRADO
+- EMGController.cpp: "// _envelope *= _lpFilter.g;".
+  Desactiva la ganancia g del filtro pasobajo de 2 Hz.
+- EMGController.cpp: "// y2 = y2 * _ulpFilter.g[1];".
+  Desactiva la ganancia de la segunda etapa ULP.
+- EMGController.cpp tiene el otro comentario "// Stage 1"/"// Stage 2", pero
+  son comentarios descriptivos y no afectan el codigo.
+- main.cpp: "// checkTouchFeedback(); // TODO..." no forma parte del filtrado.
+- main.cpp: "// 1. FILTRO ANTI-TEMBLORES ACTIVADO" solo documenta el uso real
+  de NnOutputPostProcess::process(); no desactiva el filtro.
+- main.cpp tiene "// else if (strcmp(cmd, "uw")..." y otras rutas UART
+  comentadas, que no pertenecen al procesamiento EMG.
+- NeuralNetwork.cpp tiene reservacion heap comentada:
+  "// _tensorArena = ..."; la arena sigue siendo estatica.
+  No pertenece al filtrado digital.
+
+
+5. EXPLICACION DE CADA ETAPA
+----------------------------
+
+ADC continuo
+Convierte tension EMG en valores digitales y permite dos canales sincronizados.
+No realiza filtrado: convierte, almacena y envia la muestra.
+
+Comb 50 Hz
+Elimina o reduce componente de red, que puede aparecer como interferencia.
+N=20 viene desde 20 kHz y aproxima una cancelacion cercana a 50 Hz
+(50 Hz tiene periodo 20 muestras).
+
+Valor absoluto
+Rectifica la senal bipolar EMG antes del envolvente pasobajo.
+
+Filtro pasobajo 2 Hz
+Suaviza las oscilaciones rapidas y forma una envolvente lenta de activacion.
+La ganancia g esta comentada, por lo que no se multiplica el resultado por ella.
+
+Normalizacion
+Calcula rangos adaptativos de minimo/maximo y transforma el nivel EMG.
+Esto permite que el umbral de 30 y el modelo sean mas robustos ante cambios
+de amplitud entre canales o sesiones.
+
+Umbral e histesis
+Convierte la envolvente continua en un estado activo/inactivo.
+Hysteresis = 300, maxDuration = 1000 y freezeDuration = 300 se configuran
+desde app_main(). El umbral base es 30.
+
+Ventanas y caracteristicas
+Las envolventes no se entregan directamente al modelo:
+se resumen en ventanas de 128 muestras, desplazadas cada 64 muestras.
+Esto aporta nivel instantaneo, nivel medio y diferencia bilateral.
+
+StandardScaler
+Centra y escala las caracteristicas con valores de entrenamiento antes de pasarlas
+al modelo. Si se omite, el modelo recibe datos con distribuciones incompatibles.
+
+Red neuronal
+Convierte las nueve entradas disponibles por fila historica
+(5 caracteristicas + 4 one-hot) en cuatro probabilidades de movimiento.
+
+EMA anti-temblores
+Suaviza las probabilidades con alpha=0.3.
+El debouncing exige estabilidad temporal antes de cambiar o regresar a reposo.
+
+Control final
+El valor confirmado produce acciones: reposo, abrir, cerrar o girar.
+Por defecto enableNeuralNetwork=true, asi que este control esta activo.
