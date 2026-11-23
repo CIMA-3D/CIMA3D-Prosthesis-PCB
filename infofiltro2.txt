@@ -1,0 +1,328 @@
+ANALISIS DE TIPO, ORDEN, COEFICIENTES Y FRECUENCIAS
+====================================================
+
+Fuentes revisadas
+-----------------
+Este informe contrasta el inventario de infofiltro.txt con los coeficientes
+reales presentes en:
+- components/EMGController/include/EMGController.h
+- components/EMGController/EMGController.cpp
+- main/main.cpp
+- main/NeuralNetwork.cpp
+
+Frecuencia de muestreo usada por el ADC continuo: 20 kHz.
+
+Convencion de la ecuacion IIR
+-----------------------------
+Para expresar la transferencia, el filtro se interpreta como:
+
+  H(z) = [b0 + b1*z^-1 + b2*z^-2]
+         --------------------------------
+         [1 + a0*z^-1 + a1*z^-2]
+
+En la implementacion real, los estados se actualizan con:
+
+  y = b0*x + s0
+  s0_nueva = b1*x - a0*y + s1
+  s1_nueva = b2*x - a1*y
+
+Por ello, si el codigo entrega b=[1,2,1] y a=[-1.98222893,0.982385451],
+la transferencia estandar equivalente usa b=[1,2,1] y
+a=[-1.98222893,0.982385451] en el denominador:
+
+  H(z) = (1 + 2z^-1 + z^-2)
+         -----------------------------
+         (1 - 1.98222893z^-1 + 0.982385451z^-2)
+
+
+1. FILTROS LISTADOS Y CLASIFICACION
+-----------------------------------
+
+A. applyPowerLineFilter
+Clasificacion: IIR tipo peine/comb, no FIR puro.
+Orden: 20 periodos de retardo. Desde un punto de vista polinomico tiene
+denominador y25. Es no causal? No: usa buffers circulares con el dato y la
+salida de 20 muestras anteriores.
+Ecuacion:
+
+  y[n] = x[n] - x[n-20] + 0.5*y[n-20]
+
+Coeficientes:
+- Numerador: 1 en n y -1 en n-20.
+- Retroalimentacion: 0.5 en n-20.
+- No tiene coeficientes de tipo biquad 2.
+
+Frecuencia esperada del comentario "50 Hz":
+- Con fs=20 kHz, 50 Hz implica N=400 muestras.
+- El codigo usa N=20, lo que corresponde a 1000 Hz:
+  N = fs/f = 20000/1000 = 20.
+- Por tanto no existe notch de 50 Hz en el firmware.
+
+En respuesta, el comb presenta ceros exactamente en las multiples de
+fs/N = 1000 Hz:
+- 1000 Hz
+- 2000 Hz
+- 3000 Hz
+- ...
+El ajuste de 0.5 en el denominador no los vuelve un notch estrecho de 50 Hz.
+Es una atenuacion comb periodica centrada en alrededor de 1 kHz, con polos
+de modulo 0.5 en el radio y posibilidad de anchos lobulos.
+
+Conclusion notch 50 Hz: NO.
+
+
+B. applyLPFilter
+Clasificacion: IIR segundo orden, estructura biquad.
+Orden: 2.
+Coeficientes almacenados:
+- b = [1.0, 2.0, 1.0]
+- a = [-1.98222893, 0.982385451]
+- g = 0.0000391302054
+
+Estructura:
+- Dos estados s[0] y s[1].
+- El coeficiente g esta escrito en la clase, pero su multiplicacion esta
+  comentada en EMGController.cpp.
+- Sin aplicar g, el segundo orden tiene ganancia DC aproximada:
+
+  4 / (1 - 1.98222893 + 0.982385451) = aproximadamente 25556
+
+- Al aplicar g=.0000391302054, la ganancia DC pasa a estar cercana a 1.
+  Esto confirma que g es el factor de normalizacion que completa el filtro
+  cuando se usa la biquad 1+2z^-1+z^-2.
+
+Frecuencia de corte:
+- El comentario describe "2 Hz Butterworth".
+- No existe un campo de fecha de origen que confirme la frecuencia para esta
+  implementacion.
+- Con fs=20 kHz, los polos de a=[-1.98222893,0.982385451] estan cerca de
+  z=0.9911 +- j0.0088. Su frecuencia angular corresponde aproximadamente a
+  28 Hz.
+- La respuesta calculada con estos coeficientes tiene el -3 dB aproximadamente
+  cerca de 40 Hz antes de aplicar g. La ganancia no cambia la frecuencia de
+  corte; solo normaliza el nivel.
+- En consecuencia, la afirmacion "2 Hz Butterworth" no es compatible con la
+  frecuencia de muestreo de 20 kHz si se mantienen estos coeficientes.
+
+A 50 Hz, el filtro sin normalizar tiene mucha ganancia en comparacion con DC;
+aplicando g=.0000391302054 podria tener ganancia cercana a 0.54. Sin embargo,
+esto no convierte la etapa en un filtro notch.
+
+Nota sobre implementacion:
+- abs(_sample) se usa antes del filtro.
+- Por tanto el LP no filtra la senal EMG cruda bipolar directamente. Filtra
+  una envolvente rectificada.
+- La salida es lowpass, no un filtro notch y no es una segunda etapa lineal
+  separada de la rectificacion.
+
+Aproximacion:
+- Los coeficientes parecen de Butterworth en forma de biquad, pero el nombre
+  exacto no puede confirmarse sin el script/diseno original.
+- Con estos coeficientes y fs=20 kHz no cortan a 2 Hz. Son mas razonables
+  para una aproximacion en decenas de Hz.
+- La forma 1+2z^-1+z^-2 y un par de polos simetricos es compatible con una
+  seccion de Butterworth, pero no demuestra que el diseno entregado conserve
+  el -3 dB en 2 Hz.
+
+
+C. applyULPFilter
+Clasificacion:
+- IIR segundo orden en cascada.
+- Dos secciones biquad.
+- Orden total: 4.
+
+Etapa 1
+Coefficients:
+- b1 = [1.0, 2.0, 1.0]
+- a1 = [-1.9990371, 0.9990387]
+- g1 = 0.0000004
+
+Transferencia estandar:
+  H1(z) = 0.0000004*(1+2z^-1+z^-2)
+          ---------------------------------------
+          (1-1.9990371z^-1+0.9990387z^-2)
+
+La ganancia se aplica dentro de applyULPFilter() a y1.
+La ganancia DC es aproximadamente 1.
+La constante g1=.0000004 da la normalizacion de la seccion.
+La respuesta evaluada en la presente implementacion da un -3 dB aproximado
+de unos 5-6 Hz para esta seccion aislada.
+
+Etapa 2
+Coefficients:
+- b2 = [1.0, 2.0, 1.0]
+- a2 = [-1.9976792, 0.99768073]
+- g2 = 1.0 almacenado, pero no aplicado por el comentario.
+
+Transferencia estandar:
+  H2(z) = (1+2z^-1+z^-2)
+          ---------------------------------------
+          (1-1.9976792z^-1+0.99768073z^-2)
+
+Esta etapa tiene ganancia DC aproximada de 1723 si se evalua sin g2.
+Sin embargo, el codigo suele alimentar y2 con y1 ya normalizado por g1.
+La ganancia de etapa 2 no esta comentada como linea del numerador, sino que
+la linea donde se multiplicaria por g2 esta comentada.
+
+Respuesta general:
+- Si se consideran ambas secciones como un sistema escalado por g1 y sin g2,
+  el orden efectivo es 4.
+- La cascada no es un notch.
+- La etapa 2 aislada tiene -3 dB aproximado de unos 2-3 Hz.
+
+Estado actual: INACTIVO. applyULPFilter() solo se llama desde updateSmooth(),
+que solo se ejecuta si enableCustomPrintingTask=true. Actualmente es false.
+
+Aproximacion:
+- Los polos estan muy cerca del circulo unitario y las secciones tienen
+  configuracion biquad de Butterworth/lowpass.
+- Sin el script original no se puede afirmar que son coeficientes Butterworth
+  oficiales.
+- Los cortes no se corresponden claramente con una unica frecuencia nominal
+  y no constituyen un diseno de notch.
+
+
+D. NnOutputPostProcess::process
+Clasificacion: IIR primer orden en forma de media exponencial (EMA).
+Orden: 1.
+Ecuacion:
+
+  y[n] = alpha*x[n] + (1-alpha)*y[n-1]
+
+Coeficientes reales inicializados en main.cpp:
+- alpha = 0.3
+- (1-alpha) = 0.7
+
+Transferencia:
+  H(z) = 0.3/(1-0.7z^-1)
+
+Es un filtro pasobajo exponencial de primer orden.
+Su constante de tiempo no se diseña con frecuencia de corte documentada;
+depende de cada llamada. En el recorrido principal, process() se llama una
+vez por cada inferencia completada, no a 20 kHz.
+
+Frecuencia efectiva aproximada:
+- A 20 kHz no tiene significado temporal lineal porque se ejecuta por inferencia
+  y no por muestra ADC.
+- El polo es z=0.7.
+- La salida retiene aproximadamente el 70% de la muestra anterior.
+- Se considera una estructura IIR pero no afecta al muestreo EMG directo.
+
+
+E. NnInput::update
+Clasificacion: promediado por ventanas acumuladas; no es una etapa FIR o IIR
+clasica ejecutada sobre cada ADC.
+Ventana: 128 muestras; desplazamiento: 64 muestras.
+No hay coeficientes digitales constantes para esta media, salvo 1/nn_window_size
+al calcular:
+
+  mean / nn_window_size
+
+Es una estructura de promediado rectangular en bloque:
+- Cada ventana acumula el envolvente.
+- Con nn_window_size=128, el promedio usa un coeficiente efectivo 1/128.
+- La ventana se desplaza cada nn_step_size=64.
+
+No se considera FIR implementada directamente con retardo y suma; la suma se
+mantiene en variables media y se divide al cierre de la ventana.
+No es un filtro Butterworth ni un notch.
+
+
+F. normalize
+Clasificacion: no es FIR ni IIR. Es una normalizacion adaptativa no lineal.
+No tiene coeficientes de frecuencia ni frecuencia de corte.
+No se clasifica como filtro de un tipo pole/zero.
+
+
+G. update
+Clasificacion: detector de umbral e histesis. No es FIR/IIR.
+No tiene frecuencia de corte ni polos.
+
+
+2. RESUMEN DE ORDENES
+---------------------
+
+ACTIVO EN EL PIPELINE PRINCIPAL
+- Comb 50 Hz declarado: IIR comb de retardo 20.
+- LP 2 Hz declarado: IIR/bicuad de segundo orden.
+- EMA postproceso: IIR de primer orden.
+- Promediado NN: promediado rectangular de bloque, no FIR/IIR lineal clasico.
+
+INACTIVO
+- ULP cascada: dos bicuads IIR de segundo orden; orden total 4.
+
+NO FILTROS
+- normalize()
+- update()
+- NN::run()
+- StandardScaler
+- argmax
+
+
+3. COMPROBACION DEL NOTCH DE 50 Hz
+----------------------------------
+
+Resultado:
+- No existe notch de 50 Hz implementado.
+
+Prueba de retardos:
+- Para notar 50 Hz a 20 kHz, se necesita un delay de 400:
+  N=20000/50=400.
+- El unico comb usa 20:
+  N=20.
+- El LP usa IIR pasobajo, no una banda estrecha centrada en 50 Hz.
+- Los ULP son pasobajos y no notches.
+- El EMA es pasobajo.
+
+Por frecuencia de muestreo:
+- 20 muestras equivalen a 1 kHz de repeticion del comb.
+- Los ceros de 1 kHz, 2 kHz, etc. no son 50 Hz.
+
+
+4. FRECUENCIA DE CORTE Y BUTTERWORTH
+------------------------------------
+
+LP activo
+- Coeficiente declarado: 2 Hz Butterworth.
+- Coeficientes entregados: polos y ceros compatibles con una biquad
+  pasobajo de segundo orden.
+- Comparacion con la frecuencia real:
+  Con fs=20 kHz, los coeficientes no generan una esquina de 2 Hz.
+  El par de polos corresponde aproximadamente a decenas de Hz.
+- Conclusion:
+  "Biquad de segundo orden declarada como Butterworth", pero no hay evidencia
+  suficiente para validar Butterworth 2 Hz con fs=20 kHz.
+
+ULP inactivo
+- Dos bicuads cascada.
+- El nombre ULP no incluye una aproximacion documentada.
+- Aislada, la etapa 2 tiene una respuesta cerca de pocos Hz.
+- No existe un solo corte claro sin evaluar el modelo completo con el factor g1.
+- Orden total 4.
+- No se puede llamar Butterworth sin el script que genero los coeficientes.
+
+EMA
+- Lowpass IIR de primer orden.
+- No usa la aproximacion Butterworth.
+- Butterworth no se aplica a filtros IIR de primer orden.
+
+Comb
+- IIR comb.
+- No es Butterworth.
+- No es un notch de 50 Hz.
+
+
+5. CONCLUSION TECNICA
+---------------------
+
+El firmware contiene:
+1. Un comb IIR declarado como cancelador de 50 Hz, pero con N=20. A 20 kHz no
+   elimina 50 Hz; introduce ceros periodicos cada 1000 Hz.
+2. Una biquad IIR pasobajo activa declarada como 2 Hz Butterworth. Sus
+   coeficientes no parecen corresponder a un corte de 2 Hz con fs=20 kHz.
+   La ganancia g esta normalizada en los coeficientes pero esta comentada en
+   el codigo activo.
+3. Dos bicuads IIR ultrapasobaja inactivas con orden total 4.
+4. Un EMA IIR de primer orden que suaviza probabilidades de red neuronal.
+5. Ningun filtro que pueda identificarse inequivocamente como notch Butterworth
+   de 50 Hz.
